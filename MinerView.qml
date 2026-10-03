@@ -12,8 +12,9 @@
 // content even without an own miner. With no device configured there is
 // only the network page and no switcher.
 //
-// Only `import QtQuick`, so it also runs on Android.
+// Only `QtQuick` and `QtCore` (for Settings), so it also runs on Android.
 import QtQuick
+import QtCore
 import "strings.js" as Tr
 import "roll.js" as Roll
 
@@ -25,7 +26,8 @@ Item {
     // Keyboard: Page Up/Down, Home, End. On the network page its own area
     // scrolls, on the device page this one (roll.js; from Main.qml via FeedTabs)
     function rollen(wie) {
-        return root.paneNow === "net" ? netz.rollen(wie) : Roll.rollen(flick, wie);
+        return root.paneNow === "net" ? netz.rollen(wie)
+             : root.paneNow === "pool" ? poolSeite.rollen(wie) : Roll.rollen(flick, wie);
     }
 
     property var feed: null
@@ -34,7 +36,10 @@ Item {
     property color accentColor: "#f7931a"
     property color goodColor: "#57b894"
     property color badColor: "#d9534f"
-    property real scaleUnit: Math.max(10, Math.min(width / 26, height / 16))
+    // With touch input not below 20, as on the network page: `width / 26` is
+    // about 16 in portrait on a phone, and the list of several devices ended
+    // up at ten-point text (Galaxy, 03.10.2026).
+    property real scaleUnit: Math.max(root.finger ? 20 : 10, Math.min(width / 26, height / 16))
     // Touch input: larger buttons on the network chart
     property bool finger: false
     // When nobody is looking, the network page fetches nothing.
@@ -60,31 +65,58 @@ Item {
         return v.indexOf(p) >= 0;
     }
     readonly property bool mitGeraet: root.configured && root.erlaubt("device")
-    readonly property bool mitNetz: root.erlaubt("net") || !root.mitGeraet
-    readonly property bool zweiSeiten: root.mitGeraet && root.mitNetz
-    readonly property string paneNow: !root.mitGeraet ? "net"
-                                    : !root.mitNetz ? "device"
-                                    : (root.pane === "net" ? "net" : "device")
+    // The pool page exists as soon as a pool is entered; entering it is the choice.
+    property string poolUrl: ""
+    property string poolAddress: ""
+    readonly property bool mitPool: root.poolUrl.trim() !== ""
+    readonly property bool mitNetz: root.erlaubt("net") || (!root.mitGeraet && !root.mitPool)
+    readonly property var seiten: {
+        var out = [];
+        if (root.mitGeraet)
+            out.push("device");
+        if (root.mitPool)
+            out.push("pool");
+        if (root.mitNetz)
+            out.push("net");
+        return out;
+    }
+    readonly property bool zweiSeiten: root.seiten.length > 1
+    readonly property string paneNow: root.seiten.indexOf(root.pane) >= 0 ? root.pane : root.seiten[0]
     // Solo chance on the device page, can be turned off like chart and best list.
     property bool showSolo: true
     // What the network page shows: "stats", "chart", "pools"; empty means all.
     property var netParts: []
 
+    // The devices as the daemon or `DirectMiner` reach them on the network.
     readonly property var miners: feed ? feed.miners : []
-    readonly property var total: feed ? feed.minerTotal : ({})
     readonly property bool configured: feed ? feed.minerConfigured : false
-    readonly property bool anyOnline: feed ? feed.minerOnline : false
+    // What the page shows: `geraete`, the devices from both sources, and their sum.
+    readonly property var total: {
+        var g = root.geraete, live = 0, h = 0, best = 0;
+        for (var i = 0; i < g.length; i++) {
+            if (!g[i].online)
+                continue;
+            live++;
+            h += g[i].hashRate || 0;
+            best = Math.max(best, g[i].bestDiff || 0);
+        }
+        return { "count": g.length, "online": live, "hashRate": h, "bestDiff": best };
+    }
+    readonly property bool anyOnline: root.total.online > 0
     readonly property real netDiff: (feed && feed.hashrate.difficulty) || 0
     readonly property real netHash: (feed && feed.hashrate.current) || 0
-    readonly property real bestShare: (netDiff > 0 && total.bestDiff)
-        ? total.bestDiff / netDiff : 0
+    // The top of the page shows the open device, otherwise the sum of all.
+    readonly property real shownHash: root.one ? (root.one.hashRate || 0) : (root.total.hashRate || 0)
+    readonly property real shownBest: root.one ? (root.one.bestDiff || 0) : (root.total.bestDiff || 0)
+    readonly property real bestShare: (netDiff > 0 && root.shownBest)
+        ? root.shownBest / netDiff : 0
 
     // Solo chance. Own hashrate divided by network hashrate is the share of each
     // block; with 144 blocks a day that gives the chance per day and its inverse,
     // the mean waiting time. Both are expected values of a memoryless random
     // process: after a thousand years the chance for the next day is the same.
-    readonly property real soloAnteil: (root.netHash > 0 && root.total.hashRate > 0)
-        ? root.total.hashRate / root.netHash : 0
+    readonly property real soloAnteil: (root.netHash > 0 && root.shownHash > 0)
+        ? root.shownHash / root.netHash : 0
     readonly property real soloTag: root.soloAnteil * 144
 
     // "16.600 Jahre", "64 Tage", "5 Std 20 Min"
@@ -100,9 +132,336 @@ Item {
             return Tr.t("duration.days", root.lang, Tr.group(tage, root.lang));
         return root.span(tage * 86400);
     }
-    // With exactly one device there is room for the details.
-    readonly property var one: (miners.length === 1 && miners[0].online) ? miners[0] : null
-    readonly property var oneHist: (one && feed) ? (feed.minerHistory[one.id] || ({})) : ({})
+    // ------------------------------------------------ Second source: the pool
+    //
+    // A device the app cannot reach on the network (guest Wi-Fi with client
+    // isolation, phone on mobile data) still mines, and the pool shows what
+    // it gets. With a pool and a payout address in the settings such a device
+    // keeps its row, with the pool's numbers and the pool named as source.
+    // Reachable again, the row goes back to the device's own numbers on the
+    // next poll. Never both at once.
+    //
+    // Which row belongs to which device at the pool: the worker name, the part
+    // of the stratum user after the dot ("bitaxe" in "bc1q….bitaxe"). It is
+    // remembered from the last time the device was reached and kept across
+    // restarts, so the match still holds after leaving the house. A device
+    // that was never reached here has no name yet; if as many such devices
+    // remain as unknown devices at the pool, they are paired in order. With
+    // one each, the common case, that is exact.
+    PoolKlient {
+        id: poolKlient
+
+        url: root.poolUrl
+        address: root.poolAddress
+        active: root.live && root.visible && root.mitPool
+                && (root.paneNow === "device" || root.paneNow === "pool")
+    }
+
+    // Name, worker and pool host of each device as last reached, by its id.
+    Settings {
+        id: gemerkt
+
+        category: "minerPool"
+        property string zuordnungJson: "{}"
+    }
+    readonly property var zuordnung: {
+        try {
+            return JSON.parse(gemerkt.zuordnungJson) || ({});
+        } catch (e) {
+            return ({});
+        }
+    }
+    function wirtVon(p) {
+        return String(p || "").split(":")[0].toLowerCase();
+    }
+    // Same pool if the hosts match or one is a subdomain of the other: the
+    // statistics often sit on "web." or "api." in front of the stratum host.
+    function gleicherPool(stratum) {
+        var a = root.wirtVon(stratum), b = poolKlient.wirt;
+        if (!a || !b)
+            return false;
+        return a === b || a.endsWith("." + b) || b.endsWith("." + a);
+    }
+    onMinersChanged: {
+        var zu = root.zuordnung, anders = false;
+        for (var i = 0; i < root.miners.length; i++) {
+            var m = root.miners[i];
+            if (!m.online)
+                continue;
+            var alt = zu[m.id];
+            if (!alt || alt.name !== m.name || alt.pool !== m.pool || alt.worker !== (m.worker || "")) {
+                zu[m.id] = { "name": m.name, "pool": m.pool || "", "worker": m.worker || "" };
+                anders = true;
+            }
+        }
+        if (anders)
+            gemerkt.zuordnungJson = JSON.stringify(zu);
+    }
+
+    function poolEintrag(m, w, z) {
+        var name = (z && z.name) || "";
+        if (!name && m && m.name && m.name !== m.id)
+            name = m.name;
+        return {
+            "id": m ? m.id : "pool:" + w.name,
+            "type": "pool",
+            "quelle": "pool",
+            "name": name || w.name || "–",
+            "online": w.aktiv,
+            "hashRate": w.aktiv ? w.h : 0,
+            // Two bests from the pool: the device's since it last connected
+            // (`best`, used everywhere like a device's own), and the address's
+            // ever at this pool. The second is only this device's if it is the
+            // only one under the address. AxeOS keeps its own best on the device,
+            // and a factory flash clears it, so none of the three need agree.
+            "bestDiff": w.best,
+            "bestGesamt": poolKlient.arbeiter.length === 1 && poolKlient.client
+                          ? poolKlient.zahl(poolKlient.client.bestDifficulty) : 0,
+            "verbunden": w.verbunden,
+            "alter": w.alter,
+            "pool": (z && z.pool) || poolKlient.wirt,
+            "worker": w.name
+        };
+    }
+
+    readonly property var geraete: {
+        var lokal = root.miners;
+        if (!poolKlient.bereit || !poolKlient.client)
+            return lokal;
+        var zu = root.zuordnung;
+        var frei = poolKlient.arbeiter.slice();
+        function nimm(name) {
+            for (var k = 0; k < frei.length; k++)
+                if (frei[k].name === name)
+                    return frei.splice(k, 1)[0];
+            return null;
+        }
+        // Devices reached on the network claim their worker first.
+        for (var i = 0; i < lokal.length; i++) {
+            var m = lokal[i];
+            if (m.online && m.worker && root.gleicherPool(m.pool))
+                nimm(m.worker);
+        }
+        var out = [], offen = [];
+        for (i = 0; i < lokal.length; i++) {
+            m = lokal[i];
+            if (m.online) {
+                out.push(m);
+                continue;
+            }
+            var z = zu[m.id];
+            var w = (z && z.worker && root.gleicherPool(z.pool)) ? nimm(z.worker) : null;
+            if (w) {
+                out.push(root.poolEintrag(m, w, z));
+            } else {
+                // Never reached with a worker name: a candidate for pairing.
+                if (!(z && z.worker))
+                    offen.push(out.length);
+                out.push(m);
+            }
+        }
+        var aktiv = frei.filter(function (x) {
+            return x.aktiv;
+        });
+        if (offen.length > 0 && offen.length === aktiv.length) {
+            for (i = 0; i < offen.length; i++) {
+                out[offen[i]] = root.poolEintrag(out[offen[i]], aktiv[i], zu[out[offen[i]].id]);
+                frei.splice(frei.indexOf(aktiv[i]), 1);
+            }
+        }
+        // Devices only the pool knows, not entered here at all.
+        for (i = 0; i < frei.length; i++)
+            if (frei[i].aktiv)
+                out.push(root.poolEintrag(null, frei[i], null));
+        return out;
+    }
+    readonly property bool mitPoolQuelle: {
+        for (var i = 0; i < root.geraete.length; i++)
+            if (root.geraete[i].quelle === "pool" && root.geraete[i].online)
+                return true;
+        return false;
+    }
+    readonly property real poolAnteil: {
+        var h = 0;
+        for (var i = 0; i < root.geraete.length; i++)
+            if (root.geraete[i].quelle === "pool" && root.geraete[i].online)
+                h += root.geraete[i].hashRate || 0;
+        return h;
+    }
+    function vor(sek) {
+        if (!isFinite(sek))
+            return "–";
+        if (sek < 60)
+            return Tr.t("net.justNow", root.lang);
+        return Tr.t("net.ago", root.lang, root.span(sek));
+    }
+
+    // With several devices the page lists them, and a tap on one opens its
+    // details: the same view a single device gets. The choice is only kept
+    // while that device is online; then the list comes back.
+    readonly property bool several: root.geraete.length > 1
+    property string openId: ""
+    // List and details differ in height; each starts at the top.
+    onOpenIdChanged: flick.contentY = 0
+    readonly property var opened: {
+        if (!root.several || !root.openId)
+            return null;
+        for (var i = 0; i < root.geraete.length; i++)
+            if (root.geraete[i].id === root.openId && root.geraete[i].online)
+                return root.geraete[i];
+        return null;
+    }
+    // The device whose details are shown: the only one, or the opened one.
+    readonly property var one: root.several ? root.opened
+                             : ((root.geraete.length === 1 && root.geraete[0].online) ? root.geraete[0] : null)
+    readonly property bool onePool: root.one !== null && root.one.quelle === "pool"
+    // Power of all running devices and what it costs per terahash. Only when
+    // every running device reports its power: a sum with gaps would make the
+    // efficiency look better than it is. The cgminer API has no power field,
+    // the pool neither.
+    readonly property var sumPower: {
+        var w = 0, n = 0, live = 0;
+        for (var i = 0; i < root.geraete.length; i++) {
+            var m = root.geraete[i];
+            if (!m.online)
+                continue;
+            live++;
+            if (m.power > 0) {
+                w += m.power;
+                n++;
+            }
+        }
+        return { "watt": w, "complete": live > 0 && n === live };
+    }
+    // A device seen only through the pool has no history of its own here. With
+    // a single device under the address the address chart is its chart.
+    readonly property var oneHist: {
+        if (!root.one || !root.feed)
+            return ({});
+        if (root.onePool) {
+            if (poolKlient.arbeiter.length !== 1)
+                return ({});
+            var p = (poolKlient.chart || []).map(function (x) {
+                return { "t": Date.parse(x.label) / 1000, "v": parseFloat(x.data) / 1e9 };
+            }).filter(function (x) {
+                return isFinite(x.t) && isFinite(x.v);
+            }).sort(function (a, b) {
+                return a.t - b.t;
+            });
+            return { "t": p.map(function (x) { return x.t; }),
+                     "hr": p.map(function (x) { return Math.round(x.v * 10) / 10; }),
+                     "hrNow": [], "temp": [] };
+        }
+        return root.feed.minerHistory[root.one.id] || ({});
+    }
+    // Name and pool as last reported. A device that is off reports neither, and
+    // without this it would show its address and drop out of its pool's group
+    // for as long as it is gone.
+    function nameVon(m) {
+        var b = root.zuordnung[m.id];
+        return (m.online ? m.name : (b && b.name)) || m.name || m.id;
+    }
+    function poolVon(m) {
+        var b = root.zuordnung[m.id];
+        return (m.online ? m.pool : (b && b.pool)) || m.pool || "";
+    }
+
+    // The list, grouped by pool once the devices mine on more than one. Each
+    // entry carries the pool as `kopf` if it opens a group. Unknown pool (device
+    // off, or the cgminer API, which does not report it) sorts last.
+    readonly property var liste: {
+        var reihen = root.geraete.slice();
+        var pools = [];
+        for (var i = 0; i < reihen.length; i++) {
+            var p = root.poolVon(reihen[i]);
+            if (pools.indexOf(p) < 0)
+                pools.push(p);
+        }
+        var gruppiert = pools.length > 1;
+        if (gruppiert) {
+            // Stable: within a pool the order from the settings stays.
+            var rang = function (m) {
+                var p = root.poolVon(m);
+                return p ? pools.indexOf(p) : pools.length;
+            };
+            reihen = reihen.map(function (m, k) {
+                return { "m": m, "k": k };
+            }).sort(function (a, b) {
+                return (rang(a.m) - rang(b.m)) || (a.k - b.k);
+            }).map(function (x) {
+                return x.m;
+            });
+        }
+        var out = [], vorher = null;
+        for (var j = 0; j < reihen.length; j++) {
+            var pool = root.poolVon(reihen[j]);
+            out.push({ "m": reihen[j], "kopf": gruppiert && pool !== vorher ? (pool || "–") : "" });
+            vorher = pool;
+        }
+        return out;
+    }
+
+    // Hashrate of all running devices over time, for the list view.
+    //
+    // Each device has its own timestamps: every five seconds from our own polling,
+    // once a minute from a device that records its own history, and the devices
+    // were not switched on together. So the sum is taken on a common grid, with
+    // each device's value interpolated between its two neighbouring points, and only over the
+    // span every running device covers. Outside it the sum would lack a device and
+    // the curve would drop for no real reason. No temperature: a single line for
+    // several devices would mean nothing.
+    readonly property var sumHist: {
+        if (!root.several || !root.feed)
+            return ({});
+        var reihen = [];
+        var von = -Infinity, bis = Infinity;
+        // Only devices reached directly: the pool's estimate has its own chart
+        // on the pool page, and a sum of both would mix a measurement with a
+        // guess.
+        for (var i = 0; i < root.geraete.length; i++) {
+            var m = root.geraete[i];
+            if (!m.online || m.quelle === "pool")
+                continue;
+            var h = root.feed.minerHistory[m.id];
+            if (!h || !h.t || h.t.length < 2)
+                return ({});
+            reihen.push(h);
+            von = Math.max(von, h.t[0]);
+            bis = Math.min(bis, h.t[h.t.length - 1]);
+        }
+        if (reihen.length < 2 || !(bis - von >= 60))
+            return ({});
+        var n = 120, zeit = [], summe = [];
+        var pos = reihen.map(function () {
+            return 0;
+        });
+        for (var k = 0; k < n; k++) {
+            var tg = von + (bis - von) * k / (n - 1);
+            var sum = 0, voll = true;
+            for (var r = 0; r < reihen.length; r++) {
+                var hr = reihen[r];
+                // pos[r]: first point after tg. The one before it is at or before tg.
+                while (pos[r] < hr.t.length && hr.t[pos[r]] <= tg)
+                    pos[r]++;
+                var a = pos[r] - 1, b = pos[r];
+                var va = a >= 0 ? hr.hr[a] : null;
+                var vb = b < hr.t.length ? hr.hr[b] : null;
+                if (va === null || va === undefined) {
+                    voll = false;
+                    continue;
+                }
+                if (vb === null || vb === undefined || hr.t[b] === hr.t[a])
+                    sum += va;
+                else
+                    sum += va + (vb - va) * (tg - hr.t[a]) / (hr.t[b] - hr.t[a]);
+            }
+            if (!voll)
+                continue;
+            zeit.push(Math.round(tg));
+            summe.push(Math.round(sum * 10) / 10);
+        }
+        return { "t": zeit, "hr": summe, "hrNow": [], "temp": [] };
+    }
     // If the host already has a button bar (the DMS one in the dashboard), it
     // provides the buttons itself and turns ours off. They then sit in the top
     // row where nothing can cover them.
@@ -144,7 +503,8 @@ Item {
 
     readonly property var metrics: {
         var m = root.one;
-        if (!m)
+        // The pool knows hashrate and best share, nothing of the device itself.
+        if (!m || root.onePool)
             return [];
         var alle = [
             { "id": "temp", "k": Tr.t("miner.temp", root.lang), "v": (m.temp !== undefined && m.temp !== null)
@@ -167,14 +527,17 @@ Item {
         });
     }
 
-    // From six metrics on, split into rows of three; below that one row.
+    // From six metrics on, split into rows of three; below that one row. On a
+    // narrow screen rows of two: "84213 (12 rejected)" alone takes half of it.
+    readonly property bool schmal: root.width < root.scaleUnit * 22
     readonly property var metricRows: {
         var m = root.metrics;
-        if (m.length < 6)
+        var je = root.schmal ? 2 : 3;
+        if (!root.schmal && m.length < 6)
             return m.length ? [m] : [];
         var out = [];
-        for (var i = 0; i < m.length; i += 3)
-            out.push(m.slice(i, i + 3));
+        for (var i = 0; i < m.length; i += je)
+            out.push(m.slice(i, i + je));
         return out;
     }
     readonly property bool roomForBoard: height > 240
@@ -216,7 +579,12 @@ Item {
         lang: root.lang
         title: Tr.t("miner.whatIsThis", root.lang)
         // Explanations for the page currently on top.
-        entries: root.paneNow === "net" ? [
+        entries: root.paneNow === "pool" ? [
+            {
+                "k": Tr.t("miner.panePool", root.lang),
+                "v": Tr.t("pool.help", root.lang)
+            }
+        ] : root.paneNow === "net" ? [
             {
                 "color": root.accentColor,
                 "k": Tr.t("hashrate", root.lang),
@@ -333,10 +701,10 @@ Item {
         anchors.top: parent.top
         anchors.horizontalCenter: parent.horizontalCenter
         width: umschalter.schalterBreite
-        modes: [
-            { "k": "device", "l": Tr.t("miner.paneDevice", root.lang) },
-            { "k": "net", "l": Tr.t("miner.paneNet", root.lang) }
-        ]
+        modes: root.seiten.map(function (k) {
+            return { "k": k, "l": Tr.t(k === "device" ? "miner.paneDevice"
+                                     : k === "pool" ? "miner.panePool" : "miner.paneNet", root.lang) };
+        })
         mode: root.paneNow
         labelKey: ""
         counts: []
@@ -390,6 +758,29 @@ Item {
         }
     }
 
+    // --- Pool ---
+    PoolView {
+        id: poolSeite
+
+        anchors.fill: parent
+        visible: root.paneNow === "pool"
+        live: root.live && root.visible && root.paneNow === "pool"
+        topInset: root.zweiSeiten ? root.kopfHoehe
+                                  : (root.showActions ? info.buttonWidth + root.scaleUnit * 0.3 : 0)
+        url: root.poolUrl
+        klient: poolKlient
+        miners: root.miners
+        netDiff: root.netDiff
+        lang: root.lang
+        finger: root.finger
+        scaleUnit: root.finger ? Math.max(20, root.scaleUnit) : root.scaleUnit
+        textColor: root.textColor
+        dimColor: root.dimColor
+        accentColor: root.accentColor
+        goodColor: root.goodColor
+        badColor: root.badColor
+    }
+
     // --- Configured, but all offline ---
     Column {
         anchors.centerIn: parent
@@ -409,6 +800,22 @@ Item {
             text: Tr.t("miner.offNote", root.lang)
             color: root.dimColor
             font.pixelSize: root.scaleUnit * 0.62
+        }
+
+        // Not reachable here, but the pool sees them.
+        Text {
+            anchors.horizontalCenter: parent.horizontalCenter
+            visible: root.mitPool && root.poolAddress.trim() !== ""
+            text: Tr.t("miner.seePool", root.lang)
+            color: root.accentColor
+            font.pixelSize: root.scaleUnit * 0.62
+
+            MouseArea {
+                anchors.fill: parent
+                anchors.margins: -root.scaleUnit * 0.3
+                cursorShape: Qt.PointingHandCursor
+                onClicked: root.paneRequested("pool")
+            }
         }
     }
 
@@ -451,21 +858,57 @@ Item {
                 y: Math.max(root.scaleUnit * 0.3, (flick.height - implicitHeight) / 2)
                 spacing: root.scaleUnit * 0.45
 
+            // Back to the list. Large enough for a finger on the phone.
+            Text {
+                visible: root.opened !== null
+                text: Tr.t("miner.allDevices", root.lang)
+                color: zurueckArea.containsMouse ? root.textColor : root.dimColor
+                font.pixelSize: root.scaleUnit * 0.62
+                height: root.finger ? Math.max(40, implicitHeight) : implicitHeight
+                verticalAlignment: Text.AlignVCenter
+
+                MouseArea {
+                    id: zurueckArea
+
+                    anchors.fill: parent
+                    anchors.margins: -root.scaleUnit * 0.3
+                    hoverEnabled: true
+                    cursorShape: Qt.PointingHandCursor
+                    onClicked: root.openId = ""
+                }
+            }
+
             Text {
                 anchors.horizontalCenter: parent.horizontalCenter
-                text: root.total.online > 1
+                text: root.one ? (root.one.name || root.one.id)
+                    : root.total.online > 1
                     ? Tr.t("miner.devices", root.lang, root.total.online)
-                    : (root.miners[0] ? root.miners[0].name : Tr.t("miner.title", root.lang))
+                    : (root.geraete[0] ? root.nameVon(root.geraete[0]) : Tr.t("miner.title", root.lang))
                 color: root.dimColor
                 font.pixelSize: root.scaleUnit * 0.72
             }
 
             Text {
                 anchors.horizontalCenter: parent.horizontalCenter
-                text: root.big(root.total.hashRate, "H/s")
+                text: root.big(root.shownHash, "H/s")
                 color: root.accentColor
                 font.pixelSize: root.scaleUnit * 2.6
                 font.bold: true
+            }
+
+            // Where the numbers come from when the pool stands in for the device,
+            // or how much of the sum is its estimate.
+            Text {
+                anchors.horizontalCenter: parent.horizontalCenter
+                width: Math.min(implicitWidth, parent.width)
+                horizontalAlignment: Text.AlignHCenter
+                wrapMode: Text.WordWrap
+                visible: root.onePool || (root.one === null && root.mitPoolQuelle)
+                text: root.onePool
+                    ? Tr.t("miner.sourcePool", root.lang, poolKlient.wirt, root.vor(root.one.alter))
+                    : Tr.t("miner.inclPool", root.lang, root.big(root.poolAnteil, "H/s"), poolKlient.wirt)
+                color: root.accentColor
+                font.pixelSize: root.scaleUnit * 0.55
             }
 
             // The instantaneous rate swings by about ten percent, so the top shows the
@@ -476,6 +919,19 @@ Item {
                 visible: root.one && root.one.expected
                 text: root.one && root.one.expected
                     ? Tr.t("miner.smoothed", root.lang, root.big(root.one.expected, "H/s"))
+                    : ""
+                color: root.dimColor
+                font.pixelSize: root.scaleUnit * 0.55
+            }
+
+            // All devices together: power and what one terahash costs.
+            Text {
+                anchors.horizontalCenter: parent.horizontalCenter
+                visible: root.several && root.one === null && root.sumPower.complete
+                         && root.total.hashRate > 0
+                text: visible
+                    ? Tr.fixed(root.sumPower.watt, 1, root.lang) + " W · "
+                      + Tr.fixed(root.sumPower.watt / (root.total.hashRate / 1e12), 1, root.lang) + " J/TH"
                     : ""
                 color: root.dimColor
                 font.pixelSize: root.scaleUnit * 0.55
@@ -519,12 +975,28 @@ Item {
 
                 Text {
                     anchors.horizontalCenter: parent.horizontalCenter
-                    text: root.total.bestDiff
-                        ? Tr.t("miner.ofNet", root.lang, root.big(root.total.bestDiff),
+                    text: root.shownBest
+                        ? Tr.t("miner.ofNet", root.lang, root.big(root.shownBest),
                                root.big(root.netDiff))
                         : "–"
                     color: root.textColor
                     font.pixelSize: root.scaleUnit * 0.95
+                }
+
+                // From the pool: which best this is, and the one of all time.
+                Text {
+                    anchors.horizontalCenter: parent.horizontalCenter
+                    width: Math.min(implicitWidth, parent.width)
+                    horizontalAlignment: Text.AlignHCenter
+                    wrapMode: Text.WordWrap
+                    visible: root.onePool && isFinite(root.one.verbunden)
+                    text: !visible ? ""
+                        : root.one.bestGesamt > 0
+                          ? Tr.t("miner.poolBestBoth", root.lang, root.span(root.one.verbunden),
+                                 root.big(root.one.bestGesamt))
+                          : Tr.t("miner.poolBestSession", root.lang, root.span(root.one.verbunden))
+                    color: root.dimColor
+                    font.pixelSize: root.scaleUnit * 0.55
                 }
 
                 Text {
@@ -645,12 +1117,16 @@ Item {
             }
 
             // --- History ---
+            // One device: its own history. The list of several: their sum.
             MinerChart {
+                readonly property var reihe: root.one !== null ? root.oneHist : root.sumHist
+
                 width: parent.width
                 height: root.scaleUnit * 4.2
-                visible: root.showChart && root.one !== null && root.roomForChart
-                         && (root.oneHist.hr || []).length > 1
-                hist: root.oneHist
+                visible: root.showChart && root.roomForChart
+                         && (root.one !== null || root.several)
+                         && (reihe.hr || []).length > 1
+                hist: reihe
                 lang: root.lang
                 lineColor: root.accentColor
                 dimColor: root.dimColor
@@ -685,11 +1161,14 @@ Item {
                     // readings fluctuate by more than ten percent, so the smoothed value is shown;
                     // otherwise noise looks like a defect.
                     // Minutes formatted per language, whole numbers from one minute up.
+                    // With several chips one bar per chip (`domainsAreChips`).
                     text: root.one && root.one.domainSamples
-                        ? Tr.t("miner.domainsAvg", root.lang, root.domainMin >= 1
+                        ? Tr.t(root.one.domainsAreChips ? "miner.chipsAvg" : "miner.domainsAvg",
+                               root.lang, root.domainMin >= 1
                                ? Math.round(root.domainMin)
                                : Tr.fixed(root.domainMin, 1, root.lang))
-                        : Tr.t("miner.domains", root.lang)
+                        : Tr.t(root.one && root.one.domainsAreChips ? "miner.chips" : "miner.domains",
+                               root.lang)
                     color: root.dimColor
                     font.pixelSize: root.scaleUnit * 0.55
                 }
@@ -795,61 +1274,131 @@ Item {
             }
 
             // --- Individual devices ---
+            // A tap on a running device opens its details.
             Column {
                 width: parent.width
-                spacing: root.scaleUnit * 0.2
+                spacing: root.scaleUnit * 0.1
 
                 visible: root.one === null
 
                 Repeater {
-                    model: root.miners
+                    model: root.liste
 
-                    Row {
-                        id: line
+                    Item {
+                        id: eintrag
 
                         required property var modelData
 
                         width: parent.width
-                        spacing: root.scaleUnit * 0.5
+                        height: (kopfText.visible ? kopfText.height + root.scaleUnit * 0.25 : 0) + line.height
 
-                        Rectangle {
-                            anchors.verticalCenter: parent.verticalCenter
-                            width: root.scaleUnit * 0.32
-                            height: width
-                            radius: width / 2
-                            color: line.modelData.online ? root.goodColor : root.badColor
-                        }
-
+                        // The pool above its devices, only the host: the user name
+                        // holds the payout address.
                         Text {
-                            width: root.scaleUnit * 7
+                            id: kopfText
+
+                            visible: eintrag.modelData.kopf !== ""
+                            width: parent.width
+                            y: 0
+                            text: eintrag.modelData.kopf
                             elide: Text.ElideRight
-                            text: line.modelData.name || line.modelData.id
-                            color: root.textColor
-                            font.pixelSize: root.scaleUnit * 0.62
+                            color: root.dimColor
+                            font.pixelSize: root.scaleUnit * 0.5
+                            topPadding: root.scaleUnit * 0.2
                         }
 
-                        Text {
-                            width: root.scaleUnit * 4
-                            text: line.modelData.online ? root.big(line.modelData.hashRate, "H/s") : Tr.t("miner.off", root.lang)
-                            color: root.dimColor
-                            font.pixelSize: root.scaleUnit * 0.62
-                        }
+                        Item {
+                            id: line
 
-                        Text {
-                            visible: line.modelData.online && line.modelData.temp !== undefined
-                                     && line.modelData.temp !== null
-                            width: root.scaleUnit * 2.4
-                            text: line.modelData.temp !== undefined && line.modelData.temp !== null
-                                ? Math.round(line.modelData.temp) + " °C" : ""
-                            color: root.dimColor
-                            font.pixelSize: root.scaleUnit * 0.62
-                        }
+                            readonly property var modelData: eintrag.modelData.m
 
-                        Text {
-                            visible: line.modelData.online
-                            text: root.span(line.modelData.uptime)
-                            color: root.dimColor
-                            font.pixelSize: root.scaleUnit * 0.62
+                            y: kopfText.visible ? kopfText.height + root.scaleUnit * 0.25 : 0
+                            width: parent.width
+                            height: root.finger ? Math.max(40, reihe.implicitHeight)
+                                                : reihe.implicitHeight + root.scaleUnit * 0.3
+
+                            Rectangle {
+                                anchors.fill: parent
+                                anchors.leftMargin: -root.scaleUnit * 0.3
+                                anchors.rightMargin: -root.scaleUnit * 0.3
+                                radius: root.scaleUnit * 0.25
+                                color: zeileArea.containsMouse ? Qt.rgba(1, 1, 1, 0.06) : "transparent"
+                            }
+
+                            Row {
+                                id: reihe
+
+                                anchors.verticalCenter: parent.verticalCenter
+                                width: parent.width
+                                spacing: root.scaleUnit * 0.5
+
+                                Rectangle {
+                                    anchors.verticalCenter: parent.verticalCenter
+                                    width: root.scaleUnit * 0.32
+                                    height: width
+                                    radius: width / 2
+                                    color: line.modelData.online ? root.goodColor : root.badColor
+                                }
+
+                                Text {
+                                    width: root.scaleUnit * 7
+                                    elide: Text.ElideRight
+                                    text: root.nameVon(line.modelData)
+                                    color: root.textColor
+                                    font.pixelSize: root.scaleUnit * 0.62
+                                }
+
+                                Text {
+                                    width: root.scaleUnit * 4
+                                    text: line.modelData.online ? root.big(line.modelData.hashRate, "H/s") : Tr.t("miner.off", root.lang)
+                                    color: root.dimColor
+                                    font.pixelSize: root.scaleUnit * 0.62
+                                }
+
+                                // A row the pool stands in for says so where the
+                                // temperature would be; the pool does not know it.
+                                Text {
+                                    readonly property bool ausPool: line.modelData.quelle === "pool"
+
+                                    visible: line.modelData.online && (ausPool
+                                             || (line.modelData.temp !== undefined && line.modelData.temp !== null))
+                                    width: ausPool ? implicitWidth : root.scaleUnit * 2.4
+                                    text: ausPool ? Tr.t("miner.viaPool", root.lang)
+                                        : (line.modelData.temp !== undefined && line.modelData.temp !== null
+                                           ? Math.round(line.modelData.temp) + " °C" : "")
+                                    color: ausPool ? root.accentColor : root.dimColor
+                                    font.pixelSize: root.scaleUnit * 0.62
+                                }
+
+                                // Left out on a narrow screen, the row would run off the edge.
+                                Text {
+                                    visible: line.modelData.online && !root.schmal
+                                    // From the pool: when it last heard from the device.
+                                    text: line.modelData.quelle === "pool" ? root.vor(line.modelData.alter)
+                                                                           : root.span(line.modelData.uptime)
+                                    color: root.dimColor
+                                    font.pixelSize: root.scaleUnit * 0.62
+                                }
+                            }
+
+                            Text {
+                                anchors.right: parent.right
+                                anchors.verticalCenter: parent.verticalCenter
+                                visible: line.modelData.online
+                                text: "›"
+                                color: zeileArea.containsMouse ? root.textColor : root.dimColor
+                                font.pixelSize: root.scaleUnit * 0.8
+                            }
+
+                            MouseArea {
+                                id: zeileArea
+
+                                anchors.fill: parent
+                                enabled: line.modelData.online
+                                hoverEnabled: true
+                                cursorShape: enabled ? Qt.PointingHandCursor : Qt.ArrowCursor
+                                onClicked: root.openId = line.modelData.id
+                            }
                         }
                     }
                 }
